@@ -1,0 +1,85 @@
+int main(int argc, char **argv) {
+  int nstreams = 32;       // One stream for each pair of kernels
+  float kernel_time = 10;  // Time each kernel should run in ms
+  float elapsed_time;
+  int cuda_device = 0;
+
+  printf("starting %s...\n", sSDKsample);
+
+  // Get number of streams (if overridden on the command line)
+  if (checkCmdLineFlag(argc, (const char **)argv, "nstreams")) {
+    nstreams = getCmdLineArgumentInt(argc, (const char **)argv, "nstreams");
+  }
+
+  // Use command-line specified CUDA device, otherwise use device with
+  // highest Gflops/s
+  cuda_device = findCudaDevice(argc, (const char **)argv);
+
+  // Get device properties
+  cudaDeviceProp deviceProp;
+  checkCudaErrors(cudaGetDevice(&cuda_device));
+  checkCudaErrors(cudaGetDeviceProperties(&deviceProp, cuda_device));
+
+  // HyperQ is available in devices of Compute Capability 3.5 and higher
+  if (deviceProp.major < 3 || (deviceProp.major == 3 && deviceProp.minor < 5)) {
+    if (deviceProp.concurrentKernels == 0) {
+      printf(
+          "> GPU does not support concurrent kernel execution (SM 3.5 or "
+          "higher required)\n");
+      printf("  CUDA kernel runs will be serialized\n");
+    } else {
+      printf("> GPU does not support HyperQ\n");
+      printf("  CUDA kernel runs will have limited concurrency\n");
+    }
+  }
+
+  printf("> Detected Compute SM %d.%d hardware with %d multi-processors\n",
+         deviceProp.major, deviceProp.minor, deviceProp.multiProcessorCount);
+
+  // Allocate host memory for the output (reduced to a single value)
+  clock_t *a = 0;
+  checkCudaErrors(cudaMallocHost((void **)&a, sizeof(clock_t)));
+
+  // Allocate device memory for the output (one value for each kernel)
+  clock_t *d_a = 0;
+  checkCudaErrors(cudaMalloc((void **)&d_a, 2 * nstreams * sizeof(clock_t)));
+
+  // Allocate and initialize an array of stream handles
+  cudaStream_t *streams =
+      (cudaStream_t *)malloc(nstreams * sizeof(cudaStream_t));
+
+  for (int i = 0; i < nstreams; i++) {
+    checkCudaErrors(cudaStreamCreate(&(streams[i])));
+  }
+
+  // Create CUDA event handles
+  cudaEvent_t start_event, stop_event;
+  checkCudaErrors(cudaEventCreate(&start_event));
+  checkCudaErrors(cudaEventCreate(&stop_event));
+
+  // Target time per kernel is kernel_time ms, clockRate is in KHz
+  // Target number of clocks = target time * clock frequency
+#if defined(__arm__) || defined(__aarch64__)
+  // the kernel takes more time than the channel reset time on arm archs, so to
+  // prevent hangs reduce time_clocks.
+  clock_t time_clocks = (clock_t)(kernel_time * (deviceProp.clockRate / 100));
+#else
+  clock_t time_clocks = (clock_t)(kernel_time * deviceProp.clockRate);
+#endif
+  clock_t total_clocks = 0;
+
+  // Start the clock
+  checkCudaErrors(cudaEventRecord(start_event, 0));
+
+  // Queue pairs of {kernel_A, kernel_B} in separate streams
+  for (int i = 0; i < nstreams; ++i) {
+    kernel_A<<<1, 1, 0, streams[i]>>>(&d_a[2 * i], time_clocks);
+    total_clocks += time_clocks;
+    kernel_B<<<1, 1, 0, streams[i]>>>(&d_a[2 * i + 1], time_clocks);
+    total_clocks += time_clocks;
+  }
+
+  // Stop the clock in stream 0 (i.e. all previous kernels will be complete)
+  checkCudaErrors(cudaEventRecord(stop_event, 0));
+
+  // At this point the CPU has dispatched all work for the GPU and can
